@@ -197,6 +197,9 @@ class StateTransitionPerturbationModel(PerturbationModel):
             )
             self.batch_dim = batch_dim
 
+        # Internal cache for last token features (B, S, H) from transformer for aux loss
+        self._token_features: Optional[torch.Tensor] = None
+
         # if the model is outputting to counts space, apply relu
         # otherwise its in embedding space and we don't want to
         is_gene_space = kwargs["embed_key"] == "X_hvg" or kwargs["embed_key"] is None
@@ -461,6 +464,9 @@ class StateTransitionPerturbationModel(PerturbationModel):
             res_pred = transformer_output
             self._batch_token_cache = None
 
+        # Cache token features for auxiliary batch prediction loss (B, S, H)
+        self._token_features = res_pred
+
         # add to basal if predicting residual
         if self.predict_residual and self.output_space == "all":
             # Project control_cells to hidden_dim space to match res_pred
@@ -475,8 +481,6 @@ class StateTransitionPerturbationModel(PerturbationModel):
 
         # apply relu if specified and we output to HVG space
         is_gene_space = self.hparams["embed_key"] == "X_hvg" or self.hparams["embed_key"] is None
-        # logger.info(f"DEBUG: is_gene_space: {is_gene_space}")
-        # logger.info(f"DEBUG: self.gene_decoder: {self.gene_decoder}")
         if is_gene_space or self.gene_decoder is None:
             out_pred = self.relu(out_pred)
 
@@ -569,6 +573,7 @@ class StateTransitionPerturbationModel(PerturbationModel):
             self.log("train/batch_token_loss", ce_loss)
             total_loss = total_loss + self.batch_token_weight * ce_loss
 
+        # Auxiliary batch prediction loss (per token), if enabled
         if self.gene_decoder is not None and "pert_cell_counts" in batch:
             gene_targets = batch["pert_cell_counts"]
             # Train decoder to map latent predictions to gene space
