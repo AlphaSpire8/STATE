@@ -136,14 +136,14 @@ def get_checkpoint_callbacks(output_dir: str, name: str, val_freq: int, _ckpt_ev
     checkpoint_dir = join(output_dir, name, "checkpoints")
     callbacks = []
 
-    # Save only the two best checkpoints (by val_loss) plus the latest checkpoint
+    # Save only the best checkpoint (by val_loss) plus the latest checkpoint
     best_ckpt = ModelCheckpoint(
         dirpath=checkpoint_dir,
-        filename="step={step}-val_loss={val_loss:.4f}",
+        filename="best",
         save_last=True,
         monitor="val_loss",
         mode="min",
-        save_top_k=2,
+        save_top_k=1,
         every_n_train_steps=val_freq,
     )
     callbacks.append(best_ckpt)

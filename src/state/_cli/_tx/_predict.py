@@ -332,16 +332,16 @@ def run_tx_predict(args: ap.ArgumentParser):
     var = pd.DataFrame({"gene_names": gene_names})
 
     if final_X_hvg is not None:
-        if len(gene_names) != final_pert_cell_counts_preds.shape[1]:
-            gene_names = np.load(
-                "/large_storage/ctc/userspace/aadduri/datasets/tahoe_19k_to_2k_names.npy", allow_pickle=True
-            )
-            var = pd.DataFrame({"gene_names": gene_names})
+        # if len(gene_names) != final_pert_cell_counts_preds.shape[1]:
+        #     gene_names = np.load(
+        #         "/large_storage/ctc/userspace/aadduri/datasets/tahoe_19k_to_2k_names.npy", allow_pickle=True
+        #     )
+        #     var = pd.DataFrame({"gene_names": gene_names})
 
         # Create adata for predictions - using the decoded gene expression values
-        adata_pred = anndata.AnnData(X=final_pert_cell_counts_preds, obs=obs, var=var)
+        adata_pred = anndata.AnnData(X=final_pert_cell_counts_preds, obs=obs)
         # Create adata for real - using the true gene expression values
-        adata_real = anndata.AnnData(X=final_X_hvg, obs=obs, var=var)
+        adata_real = anndata.AnnData(X=final_X_hvg, obs=obs)
 
         # add the embedding predictions
         adata_pred.obsm[data_module.embed_key] = final_preds
