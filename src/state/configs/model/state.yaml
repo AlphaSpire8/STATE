@@ -7,7 +7,7 @@ kwargs:
   blur: 0.05
   hidden_dim: 768      # hidden dimension going into the transformer backbone
   loss: energy
-  confidence_head: False
+  confidence_token: False
   n_encoder_layers: 1
   n_decoder_layers: 1
   predict_residual: True

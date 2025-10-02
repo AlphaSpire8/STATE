@@ -20,9 +20,7 @@ logger = logging.getLogger(__name__)
 
 
 class CombinedLoss(nn.Module):
-    """
-    Combined Sinkhorn + Energy loss
-    """
+    """Combined Sinkhorn + Energy loss."""
 
     def __init__(self, sinkhorn_weight=0.001, energy_weight=1.0, blur=0.05):
         super().__init__()
@@ -173,7 +171,7 @@ class StateTransitionPerturbationModel(PerturbationModel):
         elif loss_name == "mse":
             self.loss_fn = nn.MSELoss()
         elif loss_name == "se":
-            sinkhorn_weight = kwargs.get("sinkhorn_weight", 0.01)  # 1/100 = 0.01
+            sinkhorn_weight = kwargs.get("sinkhorn_weight", 0.01)
             energy_weight = kwargs.get("energy_weight", 1.0)
             self.loss_fn = CombinedLoss(sinkhorn_weight=sinkhorn_weight, energy_weight=energy_weight, blur=blur)
         elif loss_name == "sinkhorn":
@@ -288,6 +286,11 @@ class StateTransitionPerturbationModel(PerturbationModel):
         if kwargs.get("confidence_token", False):
             self.confidence_token = ConfidenceToken(hidden_dim=self.hidden_dim, dropout=self.dropout)
             self.confidence_loss_fn = nn.MSELoss()
+            self.confidence_target_scale = float(kwargs.get("confidence_target_scale", 10.0))
+            self.confidence_weight = float(kwargs.get("confidence_weight", 0.01))
+        else:
+            self.confidence_target_scale = None
+            self.confidence_weight = 0.0
 
         # Backward-compat: accept legacy key `freeze_pert`
         self.freeze_pert_backbone = kwargs.get("freeze_pert_backbone", kwargs.get("freeze_pert", False))
@@ -544,7 +547,8 @@ class StateTransitionPerturbationModel(PerturbationModel):
             pred = pred.reshape(1, -1, self.output_dim)
             target = target.reshape(1, -1, self.output_dim)
 
-        main_loss = self.loss_fn(pred, target).nanmean()
+        per_set_main_losses = self.loss_fn(pred, target)
+        main_loss = torch.nanmean(per_set_main_losses)
         self.log("train_loss", main_loss)
 
         # Log individual loss components if using combined loss
@@ -641,25 +645,18 @@ class StateTransitionPerturbationModel(PerturbationModel):
             total_loss = total_loss + self.decoder_loss_weight * decoder_loss
 
         if confidence_pred is not None:
-            # Detach main loss to prevent gradients flowing through it
-            loss_target = total_loss.detach().clone().unsqueeze(0) * 10
+            confidence_pred_vals = confidence_pred
+            if confidence_pred_vals.dim() > 1:
+                confidence_pred_vals = confidence_pred_vals.squeeze(-1)
+            confidence_targets = per_set_main_losses.detach()
+            if self.confidence_target_scale is not None:
+                confidence_targets = confidence_targets * self.confidence_target_scale
+            confidence_targets = confidence_targets.to(confidence_pred_vals.device)
 
-            # Ensure proper shapes for confidence loss computation
-            if confidence_pred.dim() == 2:  # [B, 1]
-                loss_target = loss_target.unsqueeze(0).expand(confidence_pred.size(0), 1)
-            else:  # confidence_pred is [B,]
-                loss_target = loss_target.unsqueeze(0).expand(confidence_pred.size(0))
-
-            # Compute confidence loss
-            confidence_loss = self.confidence_loss_fn(confidence_pred.squeeze(), loss_target.squeeze())
+            confidence_loss = self.confidence_weight * self.confidence_loss_fn(confidence_pred_vals, confidence_targets)
             self.log("train/confidence_loss", confidence_loss)
-            self.log("train/actual_loss", loss_target.mean())
+            self.log("train/actual_loss", confidence_targets.mean())
 
-            # Add to total loss with weighting
-            confidence_weight = 0.1  # You can make this configurable
-            total_loss = total_loss + confidence_weight * confidence_loss
-
-            # Add to total loss
             total_loss = total_loss + confidence_loss
 
         if self.regularization > 0.0:
@@ -688,7 +685,8 @@ class StateTransitionPerturbationModel(PerturbationModel):
         target = batch["pert_cell_emb"]
         target = target.reshape(-1, self.cell_sentence_len, self.output_dim)
 
-        loss = self.loss_fn(pred, target).mean()
+        per_set_main_losses = self.loss_fn(pred, target)
+        loss = torch.nanmean(per_set_main_losses)
         self.log("val_loss", loss)
 
         # Log individual loss components if using combined loss
@@ -722,19 +720,17 @@ class StateTransitionPerturbationModel(PerturbationModel):
             loss = loss + self.decoder_loss_weight * decoder_loss
 
         if confidence_pred is not None:
-            # Detach main loss to prevent gradients flowing through it
-            loss_target = loss.detach().clone() * 10
+            confidence_pred_vals = confidence_pred
+            if confidence_pred_vals.dim() > 1:
+                confidence_pred_vals = confidence_pred_vals.squeeze(-1)
+            confidence_targets = per_set_main_losses.detach()
+            if self.confidence_target_scale is not None:
+                confidence_targets = confidence_targets * self.confidence_target_scale
+            confidence_targets = confidence_targets.to(confidence_pred_vals.device)
 
-            # Ensure proper shapes for confidence loss computation
-            if confidence_pred.dim() == 2:  # [B, 1]
-                loss_target = loss_target.unsqueeze(0).expand(confidence_pred.size(0), 1)
-            else:  # confidence_pred is [B,]
-                loss_target = loss_target.unsqueeze(0).expand(confidence_pred.size(0))
-
-            # Compute confidence loss
-            confidence_loss = self.confidence_loss_fn(confidence_pred.squeeze(), loss_target.squeeze())
+            confidence_loss = self.confidence_weight * self.confidence_loss_fn(confidence_pred_vals, confidence_targets)
             self.log("val/confidence_loss", confidence_loss)
-            self.log("val/actual_loss", loss_target.mean())
+            self.log("val/actual_loss", confidence_targets.mean())
 
         return {"loss": loss, "predictions": pred}
 
@@ -747,21 +743,20 @@ class StateTransitionPerturbationModel(PerturbationModel):
         target = batch["pert_cell_emb"]
         pred = pred.reshape(1, -1, self.output_dim)
         target = target.reshape(1, -1, self.output_dim)
-        loss = self.loss_fn(pred, target).mean()
+        per_set_main_losses = self.loss_fn(pred, target)
+        loss = torch.nanmean(per_set_main_losses)
         self.log("test_loss", loss)
 
         if confidence_pred is not None:
-            # Detach main loss to prevent gradients flowing through it
-            loss_target = loss.detach().clone() * 10.0
+            confidence_pred_vals = confidence_pred
+            if confidence_pred_vals.dim() > 1:
+                confidence_pred_vals = confidence_pred_vals.squeeze(-1)
+            confidence_targets = per_set_main_losses.detach()
+            if self.confidence_target_scale is not None:
+                confidence_targets = confidence_targets * self.confidence_target_scale
+            confidence_targets = confidence_targets.to(confidence_pred_vals.device)
 
-            # Ensure proper shapes for confidence loss computation
-            if confidence_pred.dim() == 2:  # [B, 1]
-                loss_target = loss_target.unsqueeze(0).expand(confidence_pred.size(0), 1)
-            else:  # confidence_pred is [B,]
-                loss_target = loss_target.unsqueeze(0).expand(confidence_pred.size(0))
-
-            # Compute confidence loss
-            confidence_loss = self.confidence_loss_fn(confidence_pred.squeeze(), loss_target.squeeze())
+            confidence_loss = self.confidence_weight * self.confidence_loss_fn(confidence_pred_vals, confidence_targets)
             self.log("test/confidence_loss", confidence_loss)
 
     def predict_step(self, batch, batch_idx, padded=True, **kwargs):
