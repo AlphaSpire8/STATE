@@ -73,7 +73,7 @@ def run_tx_predict(args: ap.ArgumentParser):
 
     # Cell-eval for metrics computation
     from cell_eval import MetricsEvaluator
-    from cell_eval.utils import build_celltype_split_specs
+    from cell_eval.utils import split_anndata_on_celltype
     from cell_load.data_modules import PerturbationDataModule
     from tqdm import tqdm
 
@@ -467,41 +467,26 @@ def run_tx_predict(args: ap.ArgumentParser):
 
         control_pert = data_module.get_control_pert()
 
-        batch_key = data_module.batch_col if args.split_batch else None
-        if args.split_batch:
-            if not batch_key:
-                raise ValueError("--split-batch requested but no batch column is configured on the data module.")
-            logger.info(
-                "Splitting evaluation by cell type and batch column '%s'", batch_key
-            )
+        ct_split_real = split_anndata_on_celltype(adata=adata_real, celltype_col=data_module.cell_type_key)
+        ct_split_pred = split_anndata_on_celltype(adata=adata_pred, celltype_col=data_module.cell_type_key)
 
-        split_specs = build_celltype_split_specs(
-            real=adata_real,
-            pred=adata_pred,
-            celltype_col=data_module.cell_type_key,
-            batch_key=batch_key,
+        assert len(ct_split_real) == len(ct_split_pred), (
+            f"Number of celltypes in real and pred anndata must match: {len(ct_split_real)} != {len(ct_split_pred)}"
         )
 
         pdex_kwargs = dict(exp_post_agg=True, is_log1p=True)
-        for split in split_specs:
-            batch_suffix = (
-                f", batch={split.batch}"
-                if split.batch is not None and not pd.isna(split.batch)
-                else ""
-            )
-            logger.info(
-                "Evaluating metrics for celltype=%s%s",
-                split.celltype,
-                batch_suffix,
-            )
+
+        for ct in ct_split_real.keys():
+            real_ct = ct_split_real[ct]
+            pred_ct = ct_split_pred[ct]
 
             evaluator = MetricsEvaluator(
-                adata_pred=split.pred,
-                adata_real=split.real,
+                adata_pred=pred_ct,
+                adata_real=real_ct,
                 control_pert=control_pert,
                 pert_col=data_module.pert_col,
                 outdir=results_dir,
-                prefix=split.label,
+                prefix=ct,
                 pdex_kwargs=pdex_kwargs,
                 batch_size=2048,
             )
