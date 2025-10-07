@@ -20,6 +20,7 @@ kwargs:
   use_batch_token: False
   nb_decoder: False
   mask_attn: False
+  dosage: False
   use_effect_gating_token: False
   distributional_loss: energy
   init_from: null

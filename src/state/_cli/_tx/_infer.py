@@ -82,6 +82,23 @@ def add_arguments_infer(parser: argparse.ArgumentParser):
         default=None,
         help="Path to TSV file with columns 'perturbation' and 'num_cells' to pad the adata with additional perturbation cells copied from random controls.",
     )
+    parser.add_argument(
+        "--all-perts",
+        action="store_true",
+        help="If set, add virtual copies of control cells for every perturbation in the saved one-hot map so all perturbations are simulated.",
+    )
+    parser.add_argument(
+        "--min-cells",
+        type=int,
+        default=None,
+        help="Ensure each perturbation has at least this many cells by padding with virtual controls (if needed).",
+    )
+    parser.add_argument(
+        "--max-cells",
+        type=int,
+        default=None,
+        help="Upper bound on cells per perturbation after padding; subsamples excess cells if necessary.",
+    )
 
 
 def run_tx_infer(args: argparse.Namespace):
@@ -321,6 +338,7 @@ def run_tx_infer(args: argparse.Namespace):
         control_pert = "non-targeting"
     if not args.quiet:
         print(f"Control perturbation: {control_pert}")
+    control_pert_str = str(control_pert)
 
     # choose cell type column
     if args.celltype_col is None:
@@ -361,6 +379,8 @@ def run_tx_infer(args: argparse.Namespace):
     if not os.path.exists(pert_onehot_map_path):
         raise FileNotFoundError(f"Missing pert_onehot_map.pt at {pert_onehot_map_path}")
     pert_onehot_map: Dict[str, torch.Tensor] = torch.load(pert_onehot_map_path, weights_only=False)
+    pert_name_lookup: Dict[str, object] = {str(k): k for k in pert_onehot_map.keys()}
+    pert_names_in_map: List[str] = list(pert_name_lookup.keys())
 
     batch_onehot_map_path = os.path.join(args.model_dir, "batch_onehot_map.pkl")
     batch_onehot_map = None
@@ -422,6 +442,129 @@ def run_tx_infer(args: argparse.Namespace):
         adata = adata[adata.obs[args.celltype_col].isin(keep_cts)].copy()
         if not args.quiet:
             print(f"Filtered to {adata.n_obs} cells (from {n0}) for cell types: {keep_cts}")
+
+    needs_virtual_padding = args.all_perts or (args.min_cells is not None) or (args.max_cells is not None)
+    if needs_virtual_padding:
+        if args.pert_col not in adata.obs:
+            raise KeyError(f"Perturbation column '{args.pert_col}' not found in adata.obs")
+
+        adata.obs = adata.obs.copy()
+        adata.obs[args.pert_col] = adata.obs[args.pert_col].astype(str)
+
+    # optionally expand controls to cover every perturbation in the map
+    if args.all_perts:
+        observed_perts = set(adata.obs[args.pert_col].values)
+        missing_perts = [p for p in pert_names_in_map if p not in observed_perts]
+
+        if missing_perts:
+            ctrl_mask_all_perts = adata.obs[args.pert_col] == control_pert_str
+            if not bool(np.any(ctrl_mask_all_perts)):
+                raise ValueError(
+                    "--all-perts requested, but no control cells are available to template new perturbations."
+                )
+
+            ctrl_template = adata[ctrl_mask_all_perts].copy()
+            ctrl_template.obs = ctrl_template.obs.copy()
+            ctrl_template.obs[args.pert_col] = ctrl_template.obs[args.pert_col].astype(str)
+
+            virtual_blocks: List["sc.AnnData"] = []
+            for pert_name in missing_perts:
+                clone = ctrl_template.copy()
+                clone.obs = clone.obs.copy()
+                clone.obs[args.pert_col] = pert_name
+                clone.obs_names = [f"{obs_name}__virt_{pert_name}" for obs_name in clone.obs_names]
+                virtual_blocks.append(clone)
+
+            adata = sc.concat([adata, *virtual_blocks], axis=0, join="same", label=None, index_unique=None)
+
+            if not args.quiet:
+                preview = ", ".join(missing_perts[:5])
+                if len(missing_perts) > 5:
+                    preview += ", ..."
+                print(
+                    f"Added virtual control copies for {len(missing_perts)} perturbations"
+                    f" ({preview if preview else 'n/a'}). Total cells: {adata.n_obs}."
+                )
+        elif not args.quiet:
+            print("--all-perts requested, but all perturbations already present in AnnData.")
+
+    # ensure each perturbation meets the minimum count by cloning controls
+    if args.min_cells is not None:
+        if args.min_cells <= 0:
+            raise ValueError("--min-cells must be a positive integer if provided.")
+
+        ctrl_mask_min_cells = adata.obs[args.pert_col] == control_pert_str
+        if not bool(np.any(ctrl_mask_min_cells)):
+            raise ValueError("--min-cells requested, but no control cells are available for cloning.")
+
+        pad_rng = np.random.RandomState(args.seed)
+        ctrl_pool = adata[ctrl_mask_min_cells].copy()
+        ctrl_pool.obs = ctrl_pool.obs.copy()
+        virtual_blocks: List["sc.AnnData"] = []
+
+        pert_counts = adata.obs[args.pert_col].value_counts()
+        for pert_name, count in pert_counts.items():
+            deficit = int(args.min_cells) - int(count)
+            if deficit <= 0:
+                continue
+
+            sampled_idx = pad_rng.choice(ctrl_pool.n_obs, size=deficit, replace=True)
+            clone = ctrl_pool[sampled_idx].copy()
+            clone.obs = clone.obs.copy()
+            clone.obs[args.pert_col] = pert_name
+            base_names = list(clone.obs_names)
+            clone.obs_names = [
+                f"{obs_name}__virt_{pert_name}__pad{idx+1}"
+                for idx, obs_name in enumerate(base_names)
+            ]
+            virtual_blocks.append(clone)
+
+        if virtual_blocks:
+            adata = sc.concat([adata, *virtual_blocks], axis=0, join="same", label=None, index_unique=None)
+            if not args.quiet:
+                preview = ", ".join(
+                    [f"{pert}:{args.min_cells}" for pert, cnt in pert_counts.items() if int(cnt) < int(args.min_cells)][:5]
+                )
+                if len(virtual_blocks) > 5:
+                    preview += ", ..."
+                total_added = sum(vb.n_obs for vb in virtual_blocks)
+                print(
+                    f"Added {total_added} padding cells to meet --min-cells "
+                    f"(examples: {preview if preview else 'n/a'}). Total cells: {adata.n_obs}."
+                )
+        elif not args.quiet:
+            print("--min-cells set, but all perturbations already meet the threshold.")
+
+    # cap the number of cells per perturbation by subsampling
+    if args.max_cells is not None:
+        if args.max_cells <= 0:
+            raise ValueError("--max-cells must be a positive integer if provided.")
+        if args.min_cells is not None and args.max_cells < args.min_cells:
+            raise ValueError("--max-cells cannot be smaller than --min-cells.")
+
+        trim_rng = np.random.RandomState(args.seed + 1)
+        keep_mask = np.ones(adata.n_obs, dtype=bool)
+        pert_labels = adata.obs[args.pert_col].values
+
+        unique_perts = np.unique(pert_labels)
+        for pert_name in unique_perts:
+            idxs = np.where(pert_labels == pert_name)[0]
+            if len(idxs) <= args.max_cells:
+                continue
+
+            chosen = trim_rng.choice(idxs, size=args.max_cells, replace=False)
+            chosen = np.sort(chosen)
+            drop = np.setdiff1d(idxs, chosen, assume_unique=True)
+            keep_mask[drop] = False
+
+        if not np.all(keep_mask):
+            original_n = adata.n_obs
+            adata = adata[keep_mask].copy()
+            if not args.quiet:
+                total_dropped = original_n - adata.n_obs
+                print(
+                    f"Subsampled perturbations exceeding --max-cells; dropped {total_dropped} cells. Total cells: {adata.n_obs}."
+                )
 
     # select features: embeddings or genes
     if args.embed_key is None:
@@ -491,7 +634,7 @@ def run_tx_infer(args: argparse.Namespace):
     rng = np.random.RandomState(args.seed)
 
     # Identify control vs non-control
-    ctl_mask = pert_names_all == str(control_pert)
+    ctl_mask = pert_names_all == control_pert_str
     n_controls = int(ctl_mask.sum())
     n_total = adata.n_obs
     n_nonctl = n_total - n_controls
@@ -525,8 +668,9 @@ def run_tx_infer(args: argparse.Namespace):
         return grp_ctl if len(grp_ctl) > 0 else all_control_indices
 
     # default pert vector when unmapped label shows up
-    if control_pert in pert_onehot_map:
-        default_pert_vec = pert_onehot_map[control_pert].float().clone()
+    control_map_key = pert_name_lookup.get(control_pert_str, control_pert)
+    if control_map_key in pert_onehot_map:
+        default_pert_vec = pert_onehot_map[control_map_key].float().clone()
     else:
         default_pert_vec = torch.zeros(pert_dim, dtype=torch.float32)
         if pert_dim and pert_dim > 0:
@@ -568,7 +712,8 @@ def run_tx_infer(args: argparse.Namespace):
                     continue
 
                 # one-hot vector for this perturbation (repeat across window)
-                vec = pert_onehot_map.get(p, None)
+                map_key = pert_name_lookup.get(p, p)
+                vec = pert_onehot_map.get(map_key, None)
                 if vec is None:
                     vec = default_pert_vec
                     if not args.quiet:

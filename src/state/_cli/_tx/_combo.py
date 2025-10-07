@@ -71,10 +71,13 @@ def add_arguments_combo(parser: ap.ArgumentParser) -> None:
     )
     parser.add_argument("--seed", type=int, default=0, help="Random seed for control sampling.")
     parser.add_argument(
-        "--output",
+        "--output-folder",
         type=str,
         default=None,
-        help="Path to output AnnData file (.h5ad). Defaults to <adata>_combo.h5ad",
+        help=(
+            "Directory where per-perturbation AnnData outputs (.h5ad) are written."
+            " Defaults to <adata>_combo/ alongside the input file."
+        ),
     )
     parser.add_argument("--quiet", action="store_true", help="Reduce logging verbosity.")
 
@@ -83,6 +86,7 @@ def run_tx_combo(args: ap.Namespace) -> None:
     import logging
     import os
     import pickle
+    import re
 
     import anndata as ad
     import numpy as np
@@ -462,11 +466,25 @@ def run_tx_combo(args: ap.Namespace) -> None:
     control_tensor = torch.tensor(control_features, dtype=torch.float32, device=device)
 
     use_counts: bool | None = None
-    X_blocks: list[np.ndarray] = []
-    latent_blocks: list[np.ndarray] = []
-    obs_rows: list[dict[str, str | int]] = []
-
     inner_batch_size = max(1, int(args.inner_batch_size))
+
+    def _default_output_dir(path: str) -> str:
+        base_dir = os.path.dirname(os.path.abspath(path))
+        base_name = os.path.splitext(os.path.basename(path))[0]
+        return os.path.join(base_dir, f"{base_name}_combo")
+
+    output_dir = args.output_folder or _default_output_dir(args.adata)
+    output_dir = os.path.abspath(output_dir)
+    os.makedirs(output_dir, exist_ok=True)
+    logger.info("Writing per-perturbation combo outputs to %s", output_dir)
+
+    def _sanitize_filename(label: str) -> str:
+        sanitized = re.sub(r"[^0-9A-Za-z_.-]+", "_", label)
+        sanitized = sanitized.strip("._")
+        return sanitized or "perturbation"
+
+    used_output_names: dict[str, int] = {}
+    written_files: list[str] = []
 
     with torch.no_grad():
         progress_total = len(perts) * len(perts)
@@ -477,6 +495,10 @@ def run_tx_combo(args: ap.Namespace) -> None:
             disable=args.quiet,
         )
         for pert1 in perts:
+            per_pert_X_blocks: list[np.ndarray] = []
+            per_pert_latent_blocks: list[np.ndarray] = []
+            per_pert_obs_rows: list[dict[str, str | int]] = []
+
             first_batch = {
                 "ctrl_cell_emb": control_tensor.clone(),
                 "pert_emb": pert_batch_vectors[pert1],
@@ -528,47 +550,73 @@ def run_tx_combo(args: ap.Namespace) -> None:
                     latent_slice = latent_np[idx_chunk].astype(np.float32)
                     if use_counts:
                         assert counts_np is not None
-                        X_blocks.append(counts_np[idx_chunk].astype(np.float32))
+                        per_pert_X_blocks.append(counts_np[idx_chunk].astype(np.float32))
                     else:
-                        X_blocks.append(latent_slice)
-                    latent_blocks.append(latent_slice)
+                        per_pert_X_blocks.append(latent_slice)
+                    per_pert_latent_blocks.append(latent_slice)
 
                     for cell_idx in range(cell_set_len):
-                        obs_rows.append({"pert1": pert1, "pert2": pert2, "cell_index": cell_idx})
+                        per_pert_obs_rows.append({"pert1": pert1, "pert2": pert2, "cell_index": cell_idx})
 
                     progress_bar.update(1)
 
+            X_matrix = (
+                np.vstack(per_pert_X_blocks)
+                if per_pert_X_blocks
+                else np.empty((0, 0), dtype=np.float32)
+            )
+            latent_matrix = (
+                np.vstack(per_pert_latent_blocks)
+                if per_pert_latent_blocks
+                else np.empty((0, 0), dtype=np.float32)
+            )
+            obs_df = pd.DataFrame(per_pert_obs_rows)
+
+            feature_dim = 0
+            if use_counts and X_matrix.size > 0:
+                feature_dim = X_matrix.shape[1]
+            elif latent_matrix.size > 0:
+                feature_dim = latent_matrix.shape[1]
+            elif X_matrix.size > 0:
+                feature_dim = X_matrix.shape[1]
+
+            gene_names = var_dims.get("gene_names")
+            if (
+                use_counts
+                and feature_dim > 0
+                and isinstance(gene_names, (list, tuple))
+                and len(gene_names) == feature_dim
+            ):
+                var_index = pd.Index([str(name) for name in gene_names], name="gene")
+            else:
+                var_index = pd.Index([f"feature_{i}" for i in range(feature_dim)], name="feature")
+            var_df = pd.DataFrame(index=var_index)
+
+            combo_adata = ad.AnnData(X=X_matrix, obs=obs_df, var=var_df)
+            combo_adata.obsm["latent_preds"] = latent_matrix
+            combo_adata.uns["cell_type"] = str(args.cell_type)
+            combo_adata.uns["perturbations"] = perts
+            combo_adata.uns["pert1"] = pert1
+            combo_adata.uns["control_pert"] = str(args.control_pert)
+            combo_adata.uns["cell_set_len"] = cell_set_len
+            combo_adata.uns["input_embed_key"] = used_embed_key if used_embed_key is not None else "X"
+            if uses_batch_encoder and batch_col is not None:
+                combo_adata.uns["batch_col"] = batch_col
+            combo_adata.uns["inner_batch_size"] = inner_batch_size
+            combo_adata.uns["sampled_control_indices"] = adata_ct.obs_names[sampled_idx].tolist()
+
+            output_name = _sanitize_filename(pert1)
+            if output_name in used_output_names:
+                used_output_names[output_name] += 1
+                output_name = f"{output_name}_{used_output_names[output_name]}"
+            else:
+                used_output_names[output_name] = 0
+
+            output_path = os.path.join(output_dir, f"{output_name}.h5ad")
+            combo_adata.write_h5ad(output_path)
+            written_files.append(output_path)
+            logger.info("Saved combos for %s with %d cells to %s", pert1, combo_adata.n_obs, output_path)
+
         progress_bar.close()
 
-    X_matrix = np.vstack(X_blocks) if X_blocks else np.empty((0, 0), dtype=np.float32)
-    latent_matrix = np.vstack(latent_blocks) if latent_blocks else np.empty((0, 0), dtype=np.float32)
-    obs_df = pd.DataFrame(obs_rows)
-
-    feature_dim = X_matrix.shape[1] if X_matrix.size > 0 else latent_matrix.shape[1]
-    gene_names = var_dims.get("gene_names")
-    if use_counts and isinstance(gene_names, (list, tuple)) and len(gene_names) == feature_dim:
-        var_index = pd.Index([str(name) for name in gene_names], name="gene")
-    else:
-        var_index = pd.Index([f"feature_{i}" for i in range(feature_dim)], name="feature")
-    var_df = pd.DataFrame(index=var_index)
-
-    combo_adata = ad.AnnData(X=X_matrix, obs=obs_df, var=var_df)
-    combo_adata.obsm["latent_preds"] = latent_matrix
-    combo_adata.uns["cell_type"] = str(args.cell_type)
-    combo_adata.uns["perturbations"] = perts
-    combo_adata.uns["control_pert"] = str(args.control_pert)
-    combo_adata.uns["cell_set_len"] = cell_set_len
-    combo_adata.uns["input_embed_key"] = used_embed_key if used_embed_key is not None else "X"
-    if uses_batch_encoder and batch_col is not None:
-        combo_adata.uns["batch_col"] = batch_col
-    combo_adata.uns["inner_batch_size"] = inner_batch_size
-    combo_adata.uns["sampled_control_indices"] = adata_ct.obs_names[sampled_idx].tolist()
-
-    output_path = args.output or args.adata.replace(".h5ad", "_combo.h5ad")
-    output_path = os.path.abspath(output_path)
-    output_dir = os.path.dirname(output_path)
-    if output_dir and not os.path.exists(output_dir):
-        os.makedirs(output_dir, exist_ok=True)
-    combo_adata.write_h5ad(output_path)
-
-    logger.info("Saved combo AnnData with %d cells to %s", combo_adata.n_obs, output_path)
+    logger.info("Finished writing %d combo files to %s", len(written_files), output_dir)

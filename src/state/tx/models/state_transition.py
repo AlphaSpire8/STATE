@@ -1,5 +1,6 @@
+import ast
 import logging
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 import anndata as ad
 import numpy as np
@@ -8,7 +9,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from geomloss import SamplesLoss
-from typing import Tuple
 
 from .base import PerturbationModel
 from .decoders import FinetuneVCICountsDecoder
@@ -294,6 +294,13 @@ class StateTransitionPerturbationModel(PerturbationModel):
             self.confidence_target_scale = None
             self.confidence_weight = 0.0
 
+        self.use_dosage_encoder = bool(kwargs.get("dosage", False))
+        if self.use_dosage_encoder:
+            self.dosage_encoder = nn.Linear(1, self.hidden_dim)
+        else:
+            self.dosage_encoder = None
+        self._warned_missing_dosage = False
+
         # Backward-compat: accept legacy key `freeze_pert`
         self.freeze_pert_backbone = kwargs.get("freeze_pert_backbone", kwargs.get("freeze_pert", False))
         if self.freeze_pert_backbone:
@@ -431,6 +438,12 @@ class StateTransitionPerturbationModel(PerturbationModel):
         combined_input = pert_embedding + control_cells  # Shape: [B, S, hidden_dim]
         seq_input = combined_input  # Shape: [B, S, hidden_dim]
 
+        if self.use_dosage_encoder:
+            dosage_tensor = self._prepare_dosage_tensor(batch, seq_input.device, pert.shape[:2])
+            if dosage_tensor is not None:
+                dosage_features = self.dosage_encoder(torch.log1p(dosage_tensor))
+                seq_input = seq_input + dosage_features
+
         if self.batch_encoder is not None:
             # Extract batch indices (assume they are integers or convert from one-hot)
             batch_indices = batch["batch"]
@@ -530,6 +543,83 @@ class StateTransitionPerturbationModel(PerturbationModel):
             return output, confidence_pred
         else:
             return output
+
+    def _prepare_dosage_tensor(
+        self, batch: Dict[str, torch.Tensor], device: torch.device, shape: Tuple[int, int]
+    ) -> Optional[torch.Tensor]:
+        """Return dosage tensor shaped for broadcasting or None if unavailable."""
+
+        if not self.use_dosage_encoder:
+            return None
+
+        dosage_values = batch.get("pert_dosage")
+
+        if dosage_values is not None:
+            if torch.is_tensor(dosage_values):
+                dosage_tensor = dosage_values.to(device=device, dtype=torch.float32)
+            else:
+                dosage_tensor = torch.as_tensor(dosage_values, device=device, dtype=torch.float32)
+        else:
+            pert_names = batch.get("pert_name")
+            if pert_names is None:
+                if not self._warned_missing_dosage:
+                    logger.warning("Dosage encoder enabled but no dosage information found in batch; skipping dosage term.")
+                    self._warned_missing_dosage = True
+                return None
+
+            if isinstance(pert_names, torch.Tensor):
+                pert_names = pert_names.tolist()
+            if not isinstance(pert_names, (list, tuple)):
+                pert_names = [pert_names]
+
+            dosage_list = [self._parse_dosage_from_name(name) for name in pert_names]
+            dosage_tensor = torch.tensor(dosage_list, device=device, dtype=torch.float32)
+
+            if not self._warned_missing_dosage:
+                logger.warning("Falling back to parsing dosage from perturbation names; consider providing 'pert_dosage'.")
+                self._warned_missing_dosage = True
+
+        dosage_tensor = dosage_tensor.flatten()
+        expected_elems = shape[0] * shape[1]
+
+        if dosage_tensor.numel() == expected_elems:
+            return dosage_tensor.reshape(shape[0], shape[1], 1)
+
+        if dosage_tensor.numel() == shape[0] and shape[1] > 0:
+            return dosage_tensor.view(shape[0], 1, 1).expand(shape[0], shape[1], 1)
+
+        if shape[0] == 1 and dosage_tensor.numel() == shape[1]:
+            return dosage_tensor.view(1, shape[1], 1)
+
+        logger.warning(
+            "Dosage tensor has %d elements but expected either %d or %d; skipping dosage term for this batch.",
+            dosage_tensor.numel(),
+            expected_elems,
+            shape[0],
+        )
+        return None
+
+    @staticmethod
+    def _parse_dosage_from_name(name: Optional[str]) -> float:
+        """Extract dosage value from perturbation name string."""
+
+        if not isinstance(name, str):
+            return 0.0
+
+        try:
+            parsed = ast.literal_eval(name)
+        except (ValueError, SyntaxError):
+            return 0.0
+
+        try:
+            if isinstance(parsed, (list, tuple)) and len(parsed) > 0:
+                first_entry = parsed[0]
+                if isinstance(first_entry, (list, tuple)) and len(first_entry) > 1:
+                    return float(first_entry[1])
+        except (TypeError, ValueError):
+            pass
+
+        return 0.0
 
     def _compute_distribution_loss(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         """Apply the primary distributional loss, optionally chunking feature dimensions for SamplesLoss."""
