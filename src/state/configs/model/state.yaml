@@ -5,7 +5,7 @@ device: cuda
 kwargs:
   cell_set_len: 512
   blur: 0.05
-  hidden_dim: 768      # hidden dimension going into the transformer backbone
+  hidden_dim: 768
   loss: energy
   confidence_token: False
   n_encoder_layers: 1
@@ -20,15 +20,23 @@ kwargs:
   use_batch_token: False
   nb_decoder: False
   mask_attn: False
-  dosage: False
+
+  # --- Dose handling ---
+  dosage: False           # was False
+  hill_prior: True       # NEW: turn on FiLM + Hill/Emax gate + smoothing
+  dose_momentum: 0.01    # NEW: EMA for log10-dose mean/std
+  dose_strength_init: 1.0  # NEW: initial strength of FiLM modulation
+  dose_smooth_weight: 0.01 # NEW: curvature penalty across doses
+
   use_effect_gating_token: False
   distributional_loss: energy
   init_from: null
   mmd_num_chunks: 1
   randomize_mmd_chunks: false
+
   transformer_backbone_key: llama
   transformer_backbone_kwargs:
-      bidirectional_attention: false
+      bidirectional_attention: true  # was false; matches the CLI you used
       max_position_embeddings: ${model.kwargs.cell_set_len}
       hidden_size: ${model.kwargs.hidden_dim}
       intermediate_size: 3072
@@ -46,6 +54,7 @@ kwargs:
       tie_word_embeddings: false
       rotary_dim: 0
       use_rotary_embeddings: false
+
   lora:
       enable: false
       r: 16

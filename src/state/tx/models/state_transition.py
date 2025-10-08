@@ -1,6 +1,6 @@
 import ast
 import logging
-from typing import Dict, Optional, Tuple
+import math
 
 import anndata as ad
 import numpy as np
@@ -9,6 +9,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from geomloss import SamplesLoss
+from typing import Dict, Optional, Tuple
 
 from .base import PerturbationModel
 from .decoders import FinetuneVCICountsDecoder
@@ -625,6 +626,80 @@ class StateTransitionPerturbationModel(PerturbationModel):
 
         return 0.0
 
+    @staticmethod
+    def _parse_drug_from_name(name: Optional[str]) -> str:
+        """Best-effort extraction of the base drug identifier from a perturbation name."""
+        if not isinstance(name, str):
+            return "unknown"
+        try:
+            parsed = ast.literal_eval(name)
+            if isinstance(parsed, (list, tuple)) and len(parsed) > 0:
+               first_entry = parsed[0]
+                if isinstance(first_entry, (list, tuple)) and len(first_entry) > 0:
+                    return str(first_entry[0])
+        except (ValueError, SyntaxError):
+            pass
+        # Fallback: strip common separators if present
+        return name.split("@")[0].split("|")[0]
+
+    def _dose_smoothness_loss(self, batch: Dict[str, torch.Tensor], pred: torch.Tensor, padded: bool) -> torch.Tensor:
+        """
+        Encourage a smooth (low curvature) trajectory across log-dose for the same drug within the minibatch.
+        'pred' is [B,S,D] (set of cells per dose). We reduce over S (cells) first.
+       Requires 'pert_dosage' (or parseable names) to be present; otherwise returns 0.
+        """
+        if not self.use_hill_prior or self.dose_smooth_weight <= 0.0:
+            return pred.new_tensor(0.0)
+
+        B, S, D = pred.shape
+        device = pred.device
+
+        # One dose per sentence
+        dose = self._prepare_dosage_tensor(batch, device, (B, S))
+        if dose is None:
+            return pred.new_tensor(0.0)
+        dose_per_sentence = dose[:, 0, 0]  # [B]
+
+        # One drug label per sentence (best effort)
+       groups = None
+        names = batch.get("pert_name", None)
+        if names is not None:
+            if isinstance(names, torch.Tensor):
+                names_list = names.reshape(-1).tolist()
+            else:
+                names_list = list(names)
+            if len(names_list) >= B * S:
+                per_sentence = [names_list[i * S] for i in range(B)]
+            elif len(names_list) >= B:
+                per_sentence = [names_list[i] for i in range(B)]
+            else:
+                per_sentence = None
+            if per_sentence is not None:
+                groups = [self._parse_drug_from_name(n) for n in per_sentence]
+        if groups is None:
+            groups = ["__all__"] * B  # fall back to one pooled group
+
+        # Reduce each sentence to a set-level vector
+        set_pred = pred.mean(dim=1)  # [B, D]
+
+        buckets: Dict[str, list] = {}
+        for i, g in enumerate(groups):
+            buckets.setdefault(g, []).append((dose_per_sentence[i].item(), i))
+
+        losses = []
+        for _, lst in buckets.items():
+            if len(lst) < 3:
+                continue
+            lst.sort(key=lambda x: x[0])         # ascending dose
+            idx = [i for _, i in lst]
+            series = set_pred[idx]               # [Nd, D]
+            second = series[2:] - 2 * series[1:-1] + series[:-2]
+            losses.append((second ** 2).mean())
+
+        if not losses:
+            return pred.new_tensor(0.0)
+        return torch.stack(losses).mean()
+
     def _compute_distribution_loss(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         """Apply the primary distributional loss, optionally chunking feature dimensions for SamplesLoss."""
 
@@ -787,6 +862,12 @@ class StateTransitionPerturbationModel(PerturbationModel):
             # Add regularization to total loss
             total_loss = total_loss + self.regularization * l1_loss
 
+        if self.use_hill_prior and self.dose_smooth_weight > 0.0:
+            with torch.no_grad() if not self.training else torch.enable_grad():
+                smooth_loss = self._dose_smoothness_loss(batch, pred, padded=padded)
+            self.log("train/dose_smooth_loss", smooth_loss)
+            total_loss = total_loss + self.dose_smooth_weight * smooth_loss
+
         return total_loss
 
     def validation_step(self, batch: Dict[str, torch.Tensor], batch_idx: int) -> None:
@@ -847,6 +928,12 @@ class StateTransitionPerturbationModel(PerturbationModel):
             confidence_loss = self.confidence_weight * self.confidence_loss_fn(confidence_pred_vals, confidence_targets)
             self.log("val/confidence_loss", confidence_loss)
             self.log("val/actual_loss", confidence_targets.mean())
+
+        # Validation analogue of curvature penalty
+        if self.use_hill_prior and self.dose_smooth_weight > 0.0:
+            smooth_loss = self._dose_smoothness_loss(batch, pred, padded=True)
+            self.log("val/dose_smooth_loss", smooth_loss)
+            loss = loss + self.dose_smooth_weight * smooth_loss
 
         return {"loss": loss, "predictions": pred}
 
