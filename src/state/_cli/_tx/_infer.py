@@ -95,6 +95,12 @@ def add_arguments_infer(parser: argparse.ArgumentParser):
         help="If set, add virtual copies of control cells for every perturbation in the saved one-hot map so all perturbations are simulated.",
     )
     parser.add_argument(
+        "--virtual-cells-per-pert",
+        type=int,
+        default=None,
+        help="When using --all-perts, limit the number of control cells cloned for each virtual perturbation to this many (default: use all available controls).",
+    )
+    parser.add_argument(
         "--min-cells",
         type=int,
         default=None,
@@ -598,6 +604,23 @@ def run_tx_infer(args: argparse.Namespace):
             ctrl_template = adata[ctrl_mask_all_perts].copy()
             ctrl_template.obs = ctrl_template.obs.copy()
             ctrl_template.obs[args.pert_col] = ctrl_template.obs[args.pert_col].astype(str)
+
+            if args.virtual_cells_per_pert is not None:
+                if args.virtual_cells_per_pert <= 0:
+                    raise ValueError("--virtual-cells-per-pert must be a positive integer if provided.")
+                if ctrl_template.n_obs > args.virtual_cells_per_pert:
+                    virtual_rng = np.random.RandomState(args.seed)
+                    sampled_idx = virtual_rng.choice(
+                        ctrl_template.n_obs, size=args.virtual_cells_per_pert, replace=False
+                    )
+                    ctrl_template = ctrl_template[sampled_idx].copy()
+                    ctrl_template.obs = ctrl_template.obs.copy()
+                    ctrl_template.obs[args.pert_col] = ctrl_template.obs[args.pert_col].astype(str)
+                    if not args.quiet:
+                        print(
+                            "--all-perts: limiting virtual control template to "
+                            f"{ctrl_template.n_obs} cells per perturbation (requested {args.virtual_cells_per_pert})."
+                        )
 
             virtual_blocks: List["sc.AnnData"] = []
             for pert_name in missing_perts:

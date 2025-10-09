@@ -318,6 +318,8 @@ class StateTransitionPerturbationModel(PerturbationModel):
             self.confidence_weight = 0.0
 
         self.use_dosage_encoder = bool(kwargs.get("dosage", False))
+        self.dosage_encoder = nn.Linear(1, self.hidden_dim) if self.use_dosage_encoder else None
+        self._warned_missing_dosage = False
         # Feature flag: pharmacologically-informed dose handling
         self.use_hill_prior = bool(kwargs.get("hill_prior", False))
         if self.use_hill_prior:
@@ -339,31 +341,6 @@ class StateTransitionPerturbationModel(PerturbationModel):
             self.dose_smooth_weight = float(kwargs.get("dose_smooth_weight", 0.01))
         else:
             self.dose_smooth_weight = 0.0
-
-        # Dose conditioning
-        logd_norm = None  # keep to apply Hill gate after the transformer
-        if self.use_dosage_encoder:
-            dosage_tensor = self._prepare_dosage_tensor(batch, seq_input.device, pert.shape[:2])
-            if dosage_tensor is not None:
-                if self.use_hill_prior:
-                    # log10 and standardize with running stats
-                    logd = torch.log10(dosage_tensor.clamp_min(1e-9))  # [B,S,1]
-                    if self.training:
-                        with torch.no_grad():
-                            bmean = logd.mean()
-                            bstd = logd.std(unbiased=False).clamp_min(1e-6)
-                            self.dose_mean = (1 - self.dose_momentum) * self.dose_mean + self.dose_momentum * bmean
-                            self.dose_std  = (1 - self.dose_momentum) * self.dose_std  + self.dose_momentum * bstd
-                    logd_norm = (logd - self.dose_mean) / (self.dose_std + 1e-6)
-                    # FiLM modulation: seq_input <- (1 + α*(γ-1))*x + α*β
-                    film_params = self.dose_film(logd_norm)            # [B,S,2H]
-                    gamma, beta = film_params.chunk(2, dim=-1)
-                    gamma = F.softplus(gamma)                          # positive scale
-                    seq_input = (1 + self.dose_strength * (gamma - 1)) * seq_input + self.dose_strength * beta
-                else:
-                    # Legacy additive dose features
-                    dosage_features = self.dosage_encoder(torch.log1p(dosage_tensor))
-                    seq_input = seq_input + dosage_features
 
         # Backward-compat: accept legacy key `freeze_pert`
         self.freeze_pert_backbone = kwargs.get("freeze_pert_backbone", kwargs.get("freeze_pert", False))
@@ -502,11 +479,26 @@ class StateTransitionPerturbationModel(PerturbationModel):
         combined_input = pert_embedding + control_cells  # Shape: [B, S, hidden_dim]
         seq_input = combined_input  # Shape: [B, S, hidden_dim]
 
+        logd_norm: Optional[torch.Tensor] = None
         if self.use_dosage_encoder:
             dosage_tensor = self._prepare_dosage_tensor(batch, seq_input.device, pert.shape[:2])
             if dosage_tensor is not None:
-                dosage_features = self.dosage_encoder(torch.log1p(dosage_tensor))
-                seq_input = seq_input + dosage_features
+                if self.use_hill_prior:
+                    logd = torch.log10(dosage_tensor.clamp_min(1e-9))  # [B,S,1]
+                    if self.training:
+                        with torch.no_grad():
+                            bmean = logd.mean()
+                            bstd = logd.std(unbiased=False).clamp_min(1e-6)
+                            self.dose_mean = (1 - self.dose_momentum) * self.dose_mean + self.dose_momentum * bmean
+                            self.dose_std = (1 - self.dose_momentum) * self.dose_std + self.dose_momentum * bstd
+                    logd_norm = (logd - self.dose_mean) / (self.dose_std + 1e-6)
+                    film_params = self.dose_film(logd_norm)
+                    gamma, beta = film_params.chunk(2, dim=-1)
+                    gamma = F.softplus(gamma)
+                    seq_input = (1 + self.dose_strength * (gamma - 1)) * seq_input + self.dose_strength * beta
+                elif self.dosage_encoder is not None:
+                    dosage_features = self.dosage_encoder(torch.log1p(dosage_tensor))
+                    seq_input = seq_input + dosage_features
 
         if self.batch_encoder is not None:
             # Extract batch indices (assume they are integers or convert from one-hot)
