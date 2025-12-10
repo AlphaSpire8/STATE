@@ -256,12 +256,19 @@ def run_tx_train(cfg: DictConfig):
     else:
         accelerator = "cpu"
 
+    model_name_lower = cfg["model"]["name"].lower()
+    effective_max_steps = cfg["training"]["max_steps"]
+    if model_name_lower in {"perturb_mean", "context_mean"}:
+        # Mean baselines do not require long training loops; force a short run.
+        effective_max_steps = 1
+        logger.info(f"Overriding max_steps to {effective_max_steps} for model={model_name_lower}")
+
     # Decide on trainer params
     trainer_kwargs = dict(
         accelerator=accelerator,
         devices=cfg["training"].get("devices", 1),
         strategy=cfg["training"].get("strategy", "auto"),
-        max_steps=cfg["training"]["max_steps"],  # for normal models
+        max_steps=effective_max_steps,  # override for mean baselines
         check_val_every_n_epoch=None,
         val_check_interval=cfg["training"]["val_freq"],
         logger=loggers,
