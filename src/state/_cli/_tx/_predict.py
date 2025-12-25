@@ -132,14 +132,16 @@ def run_tx_predict(args: ap.ArgumentParser):
             cfg = yaml.safe_load(f)
         return cfg
 
-    def clip_anndata_values(adata: anndata.AnnData, max_value: float) -> None:
-        """Clip adata.X values in-place to avoid extremely large log1p values."""
+    def clip_anndata_values(adata: anndata.AnnData, max_value: float, min_value: float = 0.0) -> None:
+        """Clip adata.X values in-place to keep cell-eval scale checks happy."""
         if sp.issparse(adata.X):
             # Clip only the stored data to keep sparsity intact.
             if adata.X.data.size:
-                np.clip(adata.X.data, None, max_value, out=adata.X.data)
+                np.clip(adata.X.data, min_value, max_value, out=adata.X.data)
+                if hasattr(adata.X, "eliminate_zeros"):
+                    adata.X.eliminate_zeros()
         else:
-            np.clip(adata.X, None, max_value, out=adata.X)
+            np.clip(adata.X, min_value, max_value, out=adata.X)
 
     # 1. Load the config
     config_path = os.path.join(args.output_dir, "config.yaml")
@@ -413,11 +415,17 @@ def run_tx_predict(args: ap.ArgumentParser):
     logger.info("Creating anndatas from predictions from manual loop...")
 
     # Build pandas DataFrame for obs and var
+    cfg_batch_col = cfg.get("data", {}).get("kwargs", {}).get("batch_col", None)
+    batch_obs_key = cfg_batch_col or data_module.batch_col
+    print(batch_obs_key)
     df_dict = {
         data_module.pert_col: all_pert_names,
         data_module.cell_type_key: all_celltypes,
-        data_module.batch_col: all_gem_groups,
+        batch_obs_key: all_gem_groups,
     }
+    if data_module.batch_col and data_module.batch_col != batch_obs_key:
+        print("\t\t STORING BATCH")
+        df_dict[data_module.batch_col] = all_gem_groups
 
     if len(all_pert_barcodes) > 0:
         df_dict["pert_cell_barcode"] = all_pert_barcodes
@@ -461,7 +469,7 @@ def run_tx_predict(args: ap.ArgumentParser):
     # Clip extreme values to keep cell-eval log1p checks happy.
     clip_anndata_values(adata_pred, max_value=14.0)
     clip_anndata_values(adata_real, max_value=14.0)
-    logger.info("Clipped adata_pred and adata_real X values to a maximum of 14.0 before evaluation.")
+    logger.info("Clipped adata_pred and adata_real X values to [0.0, 14.0] before evaluation.")
 
     # Optionally filter to perturbations seen in at least one training context
     if args.shared_only:
