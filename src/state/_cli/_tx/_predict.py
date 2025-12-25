@@ -47,12 +47,6 @@ def add_arguments_predict(parser: ap.ArgumentParser):
     )
 
     parser.add_argument(
-        "--split-batch",
-        action="store_true",
-        help="If set, compute metrics separately for each (cell type, batch) pair.",
-    )
-
-    parser.add_argument(
         "--shared-only",
         action="store_true",
         help=("If set, restrict predictions/evaluation to perturbations shared between train and test (train ∩ test)."),
