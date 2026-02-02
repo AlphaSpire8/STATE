@@ -1,0 +1,20 @@
+# Dataset paths - maps dataset names to their directories
+[datasets]
+c36 = "/data3/fanpeishan/state/for_state/data/State-Tahoe-Filtered-processed/c36_prep.h5ad" 
+c39 = "/data3/fanpeishan/state/for_state/data/State-Tahoe-Filtered-processed/c39_prep.h5ad" 
+
+# Training specifications
+# All cell types in a dataset automatically go into training (excluding zeroshot/fewshot overrides)
+[training]
+c36 = "train"
+c39 = "train"
+
+# Zeroshot specifications - entire cell types go to val or test
+[zeroshot]
+
+# Fewshot specifications - explicit perturbation lists
+[fewshot]
+
+[fewshot."c39.CVCL_1571"]
+val = ["[('Adagrasib', 0.05, 'uM')]"]
+test = ["[('Everolimus', 5.0, 'uM')]"]

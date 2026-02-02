@@ -1,0 +1,33 @@
+# Dataset paths - maps dataset names to their directories
+[datasets]
+c37 = "/data3/fanpeishan/state/for_state/data/State-Tahoe-Filtered-processed/c37_prep.h5ad" 
+c38 = "/data3/fanpeishan/state/for_state/data/State-Tahoe-Filtered-processed/c38_prep.h5ad" 
+
+# Training specifications
+# All cell types in a dataset automatically go into training (excluding zeroshot/fewshot overrides)
+[training]
+c37 = "train"
+c38 = "train"
+
+# Zeroshot specifications - entire cell types go to val or test
+[zeroshot]
+
+# Fewshot specifications - explicit perturbation lists
+[fewshot]
+
+[fewshot."c37.CVCL_1547"]
+val = ["[('Almonertinib (mesylate)', 0.5, 'uM')]","[('Clonidine (hydrochloride)', 5.0, 'uM')]"]
+test = ["[('Naproxen', 0.5, 'uM')]","[('Berberine (chloride hydrate)', 5.0, 'uM')]"]
+
+
+# c37_prep：drugname_drugconc                        数量(前十个高频药物)
+#[('DMSO_TF', 0.0, 'uM')]                         45150
+#[('Adagrasib', 0.05, 'uM')]                      23449
+#[('Afatinib', 0.5, 'uM')]                         6042
+#[('Almonertinib (mesylate)', 0.5, 'uM')]          5277
+#[('Clonidine (hydrochloride)', 5.0, 'uM')]        4556
+#[('Naproxen', 0.5, 'uM')]                         4551
+#[('Berberine (chloride hydrate)', 5.0, 'uM')]     4550
+#[('Berbamine (dihydrochloride)', 0.5, 'uM')]      4480
+#[('Belumosudil', 0.5, 'uM')]                      4465
+#[('Gemfibrozil', 5.0, 'uM')]                      4410
