@@ -1,0 +1,14 @@
+changed(去掉括号):
+Trametinib (DMSO_TF solvate)
+Pitavastatin (Calcium) 
+Clonidine (hydrochloride)
+Quinidine (15% dihydroquinidine) 
+Osimertinib (mesylate) 
+
+unfound:
+Verteporfin
+γ-Oryzanol
+Sacubitril/Valsartan
+18β-Glycyrrhetinic acid
+DMSO_TF（这个可以不用管）
+Ivermectin
