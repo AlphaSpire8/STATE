@@ -6,9 +6,29 @@ lightning_logs/
 outputs/
 log/
 uv.lock
-tmp/
 notebooks/
 *.sif
 *.slurm
-temp
 wandb/
+
+# bio data
+*.h5ad
+*.h5
+
+# temporary files
+tmp/
+temp
+temp/
+
+# virtual environment
+venv/
+env/
+.venv/
+
+# PyTorch
+*.pt
+*.pth
+*.torch          
+checkpoints/
+*.ckpt
+*.pkl
